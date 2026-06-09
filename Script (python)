@@ -1,0 +1,214 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import h5py
+from dedalus import public as de
+from dedalus.extras import flow_tools
+import time
+import logging
+root = logging.root
+from scipy.misc import derivative
+import scipy.integrate as integrate
+
+for h in root.handlers:
+    h.setLevel("INFO")
+logger = logging.getLogger(__name__)
+
+# domain size
+Ly = 20
+ny = 512
+
+# basis and domain
+y_basis = de.Chebyshev('y', ny, interval=(-Ly/2,Ly/2), dealias=1)
+domain = de.Domain([y_basis], grid_dtype=np.float64)
+
+# parameters, equations and boundary conditions
+problem = de.IVP(domain, variables=['ψ1','ψ2','ψ1y','ψ2y'])
+
+b1 = 2    # transient magnetic field; Figure 5: b1=1.5; Figure 6: b1=2
+b0 = 1    # initial and final magnetic field; Figure 5: b0=0.5; Figure 6: b0=1
+τ  = 0.02 # variation time; Figure 5: τ=1; Figure 6: τ=0.02
+T  = 30   # simulation time; Figure 5: T=40; Figure 6: T=30
+
+def b(t1):
+    return (b0 + b1)/2 + (b0 - b1)*np.tanh((t1 - 9.5)/τ)*np.tanh((t1 - 9.5 - 7*np.pi/b1)/τ)/2 # Figure 5: (b0 + b1)/2 + (b0 - b1)*np.tanh((t1 - 8)/τ)*np.tanh((t1 - 26)/τ)/2; Figure 6: (b0 + b1)/2 + (b0 - b1)*np.tanh((t1 - 9.5)/τ)*np.tanh((t1 - 9.5 - 7*np.pi/b1)/τ)/2
+
+problem.parameters['b1'] = b1
+problem.parameters['b0'] = b0
+problem.parameters['τ']  = τ
+problem.parameters['π']  = np.pi
+
+problem.substitutions['Δb'] = "(b0 + b1)/2 + (b0 - b1)*tanh((t - 9.5)/τ)*tanh((t - 9.5 - 7*π/b1)/τ)/2 - b0"
+
+problem.add_equation("-dt(ψ2) + dy(ψ1y)/2 - b0*b0*y*y*ψ1/2 = b0*Δb*y*y*ψ1 + Δb*Δb*y*y*ψ1/2")
+problem.add_equation(" dt(ψ1) + dy(ψ2y)/2 - b0*b0*y*y*ψ2/2 = b0*Δb*y*y*ψ2 + Δb*Δb*y*y*ψ2/2")
+problem.add_equation(" dy(ψ1) - ψ1y                        = 0")
+problem.add_equation(" dy(ψ2) - ψ2y                        = 0")
+
+problem.add_bc("left(ψ1)  = 0")
+problem.add_bc("left(ψ2)  = 0")
+problem.add_bc("right(ψ1) = 0")
+problem.add_bc("right(ψ2) = 0")
+
+ts = de.timesteppers.RK443
+solver =  problem.build_solver(ts)
+
+# initial state
+y = domain.grid(0)
+
+ψ1  = solver.state['ψ1']
+ψ2  = solver.state['ψ2']
+ψ1y = solver.state['ψ1y']
+ψ2y = solver.state['ψ2y']
+
+n  = 2 # Landau level
+ψ1['g'] = np.exp(-b0*y*y/2)*np.sqrt(np.sqrt(b0/np.pi))*(2*b0*y*y - 1)/np.sqrt(2)
+ψ2['g'] = 0
+ψ1.differentiate('y', out=ψ1y)
+ψ2.differentiate('y', out=ψ2y)
+
+solver.stop_sim_time = T
+solver.stop_wall_time = np.inf
+solver.stop_iteration = np.inf
+
+initial_dt = 5e-3
+
+# main loop
+y = domain.grid(0, scales=domain.dealias)
+
+Rho = domain.new_field(name='Rho', scales=domain.dealias) # density ρ
+Rho['g'] = ψ1['g']*ψ1['g'] + ψ2['g']*ψ2['g']
+Rhoy2 = domain.new_field(name='Rhoy2', scales=domain.dealias) # ρy^2
+Rhoy2['g'] = (ψ1['g']*ψ1['g'] + ψ2['g']*ψ2['g'])*y*y
+Rho_y = domain.new_field(name='Rho_y', scales=domain.dealias) # dρ/dy
+Rho_y['g'] = 2*ψ1['g']*ψ1y['g'] + 2*ψ2['g']*ψ2y['g']
+Imvy = domain.new_field(name='Imvy', scales=domain.dealias) # mass flux ρv
+Imvy['g'] = ψ1['g']*ψ2y['g'] - ψ1y['g']*ψ2['g']
+
+ekx = domain.new_field(name='ekx', scales=domain.dealias) # density of zonal kinetic energy
+ekx['g'] = Rho['g']*b(solver.sim_time)*b(solver.sim_time)*y*y/2
+eky = domain.new_field(name='eky', scales=domain.dealias) # density of meridional kinetic energy
+eky['g'] = Imvy['g']*Imvy['g']/Rho['g']/2
+eQ = domain.new_field(name='eQ', scales=domain.dealias) # density of potential energy
+eQ['g'] = Rho_y['g']*Rho_y['g']/Rho['g']/8 - y_basis.Differentiate(Rho_y)['g']/4
+
+t_list  = [solver.sim_time]
+ρ_list  = [np.copy(Rho['g'])]
+ρv_list = [np.copy(Imvy['g'])]
+
+# total energies
+Ekx_list = [de.operators.integrate(ekx,'y').evaluate()['g'][0]]
+Eky_list = [de.operators.integrate(eky,'y').evaluate()['g'][0]]
+EQ_list  = [de.operators.integrate(eQ,'y').evaluate()['g'][0]]
+
+Y2_list = [de.operators.integrate(Rhoy2,'y').evaluate()['g'][0]/de.operators.integrate(Rho,'y').evaluate()['g'][0]] # <y^2> to compute Γ(t)
+
+plt.figure(figsize=(10,6))
+plt.plot(y.ravel(), Rho['g'].ravel(), color='firebrick', linewidth=2, label=r"$t=${:.4f}".format(solver.sim_time))
+plt.xlim(-Ly/2,Ly/2)
+plt.ylim(0,1)
+plt.xlabel('$y$')
+plt.ylabel('$ρ$')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+logger.info('Starting loop')
+start_time = time.time()
+
+while solver.ok:
+    solver.step(initial_dt)
+    
+    if solver.iteration % 5 == 0:
+        
+        Rho = domain.new_field(name='Rho', scales=domain.dealias)
+        Rho['g'] = ψ1['g']*ψ1['g'] + ψ2['g']*ψ2['g']
+        Rhoy2 = domain.new_field(name='Rhoy2', scales=domain.dealias)
+        Rhoy2['g'] = (ψ1['g']*ψ1['g'] + ψ2['g']*ψ2['g'])*y*y
+        Rho_y = domain.new_field(name='Rho_y', scales=domain.dealias)
+        Rho_y['g'] = 2*ψ1['g']*ψ1y['g'] + 2*ψ2['g']*ψ2y['g']
+        Imvy = domain.new_field(name='Imvy', scales=domain.dealias)
+        Imvy['g'] = ψ1['g']*ψ2y['g'] - ψ1y['g']*ψ2['g']
+
+        ekx = domain.new_field(name='ekx', scales=domain.dealias)
+        ekx['g'] = Rho['g']*b(solver.sim_time)*b(solver.sim_time)*y*y/2
+        eky = domain.new_field(name='eky', scales=domain.dealias)
+        eky['g'] = Imvy['g']*Imvy['g']/Rho['g']/2
+        eQ = domain.new_field(name='eQ', scales=domain.dealias)
+        eQ['g'] = Rho_y['g']*Rho_y['g']/Rho['g']/8 - y_basis.Differentiate(Rho_y)['g']/4
+
+        t_list.append(solver.sim_time)
+        ρ_list.append(np.copy(Rho['g']))
+        ρv_list.append(np.copy(Imvy['g']))
+        
+        Ekx_list.append(de.operators.integrate(ekx,'y').evaluate()['g'][0])
+        Eky_list.append(de.operators.integrate(eky,'y').evaluate()['g'][0])
+        EQ_list.append(de.operators.integrate(eQ,'y').evaluate()['g'][0])
+
+        Y2_list.append(de.operators.integrate(Rhoy2,'y').evaluate()['g'][0]/de.operators.integrate(Rho,'y').evaluate()['g'][0])
+        
+        logger.info('Iteration: %i, Time: %e' %(solver.iteration, solver.sim_time))
+
+        plt.figure(figsize=(10,6))
+        plt.plot(y.ravel(), Rho['g'].ravel(), color='firebrick', linewidth=2, label=r"$t=${:.4f}".format(solver.sim_time))
+        plt.xlim(-Ly/2,Ly/2)
+        plt.ylim(0,1)
+        plt.xlabel('$y$')
+        plt.ylabel('$ρ$')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+        
+end_time = time.time()
+
+logger.info('Run time: %f' %(end_time-start_time))
+logger.info('Iterations: %i' %solver.iteration)
+
+# plot colormap for mass flux
+plt.figure(figsize=(10,3))
+
+plt.pcolormesh(np.array(t_list), y.ravel(), np.transpose(np.array([y for x, y in zip(ρ_list, ρv_list)])), cmap='PuOr', vmin=-0.2, vmax=0.2, shading='gouraud')
+
+plt.xlim(0,T)
+plt.ylim(-Ly/2,Ly/2)
+plt.xticks(())
+plt.yticks(())
+
+plt.tight_layout()
+#plt.savefig('n=2_mass_flux.pdf', transparent=True)
+plt.show
+
+# plot energy partition
+plt.figure(figsize=(10,3))
+
+plt.scatter(t_list, Ekx_list, color='navy', s=2)
+plt.scatter(t_list, Eky_list, color='goldenrod', s=2)
+plt.scatter(t_list, EQ_list, color='brown', s=2)
+plt.scatter(t_list, [x + y + z for x, y, z in zip(Ekx_list, Eky_list, EQ_list)], color='purple', s=2)
+
+plt.plot([0,T], [b0*(n + 1/2),b0*(n + 1/2)], linestyle='dashed', color='black', linewidth=1)
+plt.plot([0,T], [b1*(n + 1/2),b1*(n + 1/2)], linestyle='dashed', color='black', linewidth=1)
+
+plt.xlim(0,T)
+plt.ylim(0,10)
+plt.xticks(())
+plt.yticks(())
+
+plt.tight_layout()
+#plt.savefig('energy_partition.pdf', transparent=True)
+plt.show
+
+# plot Γ(t) VS b(t)
+plt.figure(figsize=(10, 3))
+
+plt.scatter(t_list, [(n + 1/2)/x for x in Y2_list],color='firebrick',s=2)
+plt.scatter(t_list, [b(t) for t in t_list], color='blue', s=2)
+
+plt.xlim(0,T)
+plt.ylim(0,6)
+plt.xticks(())
+plt.yticks(())
+
+plt.tight_layout()
+#plt.savefig('b_VS_Gamma.pdf', transparent=True)
+plt.show
